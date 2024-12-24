@@ -7,18 +7,28 @@ import (
 
 	"github.com/johnayoung/finlib/pkg/account"
 	"github.com/johnayoung/finlib/pkg/money"
+	"github.com/johnayoung/finlib/pkg/storage"
+	"github.com/johnayoung/finlib/pkg/transaction"
 	"github.com/shopspring/decimal"
 )
 
 // defaultReportCalculator implements the ReportCalculator interface
 type defaultReportCalculator struct {
-	accountStore account.Repository
+	accountStore     account.Repository
+	transactionProc  transaction.TransactionProcessor
+	transactionStore storage.Repository
 }
 
 // NewReportCalculator creates a new instance of the report calculator
-func NewReportCalculator(accountStore account.Repository) ReportCalculator {
+func NewReportCalculator(
+	accountStore account.Repository,
+	transactionProc transaction.TransactionProcessor,
+	transactionStore storage.Repository,
+) ReportCalculator {
 	return &defaultReportCalculator{
-		accountStore: accountStore,
+		accountStore:     accountStore,
+		transactionProc:  transactionProc,
+		transactionStore: transactionStore,
 	}
 }
 
@@ -30,36 +40,50 @@ func (c *defaultReportCalculator) CalculateBalance(ctx context.Context, accountI
 		return money.Money{}, fmt.Errorf("error reading account: %w", err)
 	}
 
-	// Get all transactions for the account within the period
-	transactions, err := c.getTransactions(ctx, accountID, period)
+	// Get transactions for the period
+	transactions, err := c.getTransactionsForPeriod(ctx, accountID, period)
 	if err != nil {
 		return money.Money{}, fmt.Errorf("error getting transactions: %w", err)
 	}
 
-	// Calculate the balance based on transactions
-	balance := c.calculateBalanceFromTransactions(transactions, acc.Type)
-
-	return balance, nil
+	// Calculate balance from transactions
+	return c.calculateBalanceFromTransactions(transactions, acc.Type)
 }
 
 // CalculateChanges computes changes over a period
 func (c *defaultReportCalculator) CalculateChanges(ctx context.Context, accountID string, period ReportPeriod) (*BalanceChange, error) {
-	// Get opening balance
+	// Get transactions for the period
+	transactions, err := c.getTransactionsForPeriod(ctx, accountID, period)
+	if err != nil {
+		return nil, fmt.Errorf("error getting transactions: %w", err)
+	}
+
+	// Calculate opening balance (balance at start of period)
 	openingBalance, err := c.getBalanceAtTime(ctx, accountID, period.Start)
 	if err != nil {
-		return nil, fmt.Errorf("error getting opening balance: %w", err)
+		return nil, fmt.Errorf("error calculating opening balance: %w", err)
 	}
 
-	// Get closing balance
+	// Calculate closing balance (balance at end of period)
 	closingBalance, err := c.getBalanceAtTime(ctx, accountID, period.End)
 	if err != nil {
-		return nil, fmt.Errorf("error getting closing balance: %w", err)
+		return nil, fmt.Errorf("error calculating closing balance: %w", err)
 	}
 
-	// Get movements during the period
-	movements, err := c.getMovements(ctx, accountID, period)
-	if err != nil {
-		return nil, fmt.Errorf("error getting movements: %w", err)
+	// Get movements from transactions
+	movements := make([]BalanceMovement, 0, len(transactions))
+	for _, tx := range transactions {
+		for _, entry := range tx.Entries {
+			if entry.AccountID == accountID {
+				movements = append(movements, BalanceMovement{
+					Date:        tx.Date,
+					Amount:      entry.Amount,
+					Type:        string(entry.Type),
+					Description: tx.Description,
+					Reference:   tx.ID,
+				})
+			}
+		}
 	}
 
 	// Calculate net change
@@ -106,47 +130,141 @@ func (c *defaultReportCalculator) CalculateRatio(ctx context.Context, ratio Rati
 
 // Helper functions
 
-func (c *defaultReportCalculator) getTransactions(ctx context.Context, accountID string, period ReportPeriod) ([]Transaction, error) {
-	// This would be implemented to fetch transactions from a transaction store
-	// For now, return a not implemented error
-	return nil, fmt.Errorf("getTransactions not implemented")
+func (c *defaultReportCalculator) getTransactionsForPeriod(ctx context.Context, accountID string, period ReportPeriod) ([]*transaction.Transaction, error) {
+	// Create a query to find transactions for the account within the period
+	query := storage.Query{
+		Filters: []storage.Filter{
+			{Field: "entries.account_id", Operator: "=", Value: accountID},
+			{Field: "date", Operator: ">=", Value: period.Start},
+			{Field: "date", Operator: "<=", Value: period.End},
+			{Field: "status", Operator: "=", Value: transaction.Posted},
+		},
+		Sort: []storage.Sort{
+			{Field: "date", Desc: false},
+		},
+	}
+
+	var transactions []*transaction.Transaction
+	if err := c.transactionStore.Query(ctx, query, &transactions); err != nil {
+		return nil, fmt.Errorf("error querying transactions: %w", err)
+	}
+
+	return transactions, nil
 }
 
-func (c *defaultReportCalculator) calculateBalanceFromTransactions(transactions []Transaction, accountType account.AccountType) money.Money {
-	// This would implement the actual balance calculation logic
-	// For now, return a zero balance
-	return money.Money{
-		Amount:   decimal.Zero,
-		Currency: "USD", // Default currency, should be configurable
+func (c *defaultReportCalculator) calculateBalanceFromTransactions(transactions []*transaction.Transaction, accountType account.AccountType) (money.Money, error) {
+	if len(transactions) == 0 {
+		return money.Money{Amount: decimal.Zero, Currency: "USD"}, nil
 	}
+
+	// Use the currency of the first transaction as the balance currency
+	currency := transactions[0].Entries[0].Amount.Currency
+	balance := decimal.Zero
+
+	for _, tx := range transactions {
+		for _, entry := range tx.Entries {
+			if entry.Amount.Currency != currency {
+				return money.Money{}, fmt.Errorf("mixed currencies in transactions")
+			}
+
+			switch entry.Type {
+			case transaction.Debit:
+				if accountType == account.Asset || accountType == account.Expense {
+					balance = balance.Add(entry.Amount.Amount)
+				} else {
+					balance = balance.Sub(entry.Amount.Amount)
+				}
+			case transaction.Credit:
+				if accountType == account.Asset || accountType == account.Expense {
+					balance = balance.Sub(entry.Amount.Amount)
+				} else {
+					balance = balance.Add(entry.Amount.Amount)
+				}
+			}
+		}
+	}
+
+	return money.Money{Amount: balance, Currency: currency}, nil
 }
 
 func (c *defaultReportCalculator) getBalanceAtTime(ctx context.Context, accountID string, at time.Time) (money.Money, error) {
-	// This would calculate the balance at a specific point in time
-	// For now, return a not implemented error
-	return money.Money{}, fmt.Errorf("getBalanceAtTime not implemented")
-}
+	// Get all transactions up to the specified time
+	period := ReportPeriod{
+		Start: time.Time{}, // Beginning of time
+		End:   at,
+	}
 
-func (c *defaultReportCalculator) getMovements(ctx context.Context, accountID string, period ReportPeriod) ([]BalanceMovement, error) {
-	// This would get all balance movements in a period
-	// For now, return a not implemented error
-	return nil, fmt.Errorf("getMovements not implemented")
+	transactions, err := c.getTransactionsForPeriod(ctx, accountID, period)
+	if err != nil {
+		return money.Money{}, fmt.Errorf("error getting transactions: %w", err)
+	}
+
+	// Get the account to determine its type
+	var acc account.Account
+	if err := c.accountStore.Read(ctx, accountID, &acc); err != nil {
+		return money.Money{}, fmt.Errorf("error reading account: %w", err)
+	}
+
+	return c.calculateBalanceFromTransactions(transactions, acc.Type)
 }
 
 func (c *defaultReportCalculator) calculateValue(ctx context.Context, calc Calculation, period ReportPeriod) (decimal.Decimal, error) {
-	// This would implement the calculation logic based on the calculation type
-	// For now, return a not implemented error
-	return decimal.Zero, fmt.Errorf("calculateValue not implemented")
+	// Get accounts matching the selector
+	accounts, err := c.getAccountsForSelector(ctx, calc.AccountSelector)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("error getting accounts: %w", err)
+	}
+
+	// Calculate total for all matching accounts
+	total := decimal.Zero
+	for _, acc := range accounts {
+		balance, err := c.CalculateBalance(ctx, acc.ID, period)
+		if err != nil {
+			return decimal.Zero, fmt.Errorf("error calculating balance for account %s: %w", acc.ID, err)
+		}
+		total = total.Add(balance.Amount)
+	}
+
+	return total, nil
 }
 
-// Transaction represents a financial transaction
-// This should be moved to a separate package when implementing the full transaction system
-type Transaction struct {
-	ID          string
-	AccountID   string
-	Amount      money.Money
-	Type        string
-	Date        time.Time
-	Description string
-	Metadata    map[string]interface{}
+func (c *defaultReportCalculator) getAccountsForSelector(ctx context.Context, selector AccountSelector) ([]*account.Account, error) {
+	// Create a query based on the selector criteria
+	query := storage.Query{
+		Filters: make([]storage.Filter, 0),
+	}
+
+	// Add type filters
+	if len(selector.Types) > 0 {
+		query.Filters = append(query.Filters, storage.Filter{
+			Field:    "type",
+			Operator: "in",
+			Value:    selector.Types,
+		})
+	}
+
+	// Add code filters
+	if len(selector.Codes) > 0 {
+		query.Filters = append(query.Filters, storage.Filter{
+			Field:    "code",
+			Operator: "in",
+			Value:    selector.Codes,
+		})
+	}
+
+	// Add category filters
+	if len(selector.Categories) > 0 {
+		query.Filters = append(query.Filters, storage.Filter{
+			Field:    "category",
+			Operator: "in",
+			Value:    selector.Categories,
+		})
+	}
+
+	var accounts []*account.Account
+	if err := c.accountStore.Query(ctx, query, &accounts); err != nil {
+		return nil, fmt.Errorf("error querying accounts: %w", err)
+	}
+
+	return accounts, nil
 }
