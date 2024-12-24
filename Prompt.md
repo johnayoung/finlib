@@ -100,4 +100,4 @@ When showing code:
 
 IMPORTANT: Your role is to help build a production-grade financial system. Financial accuracy and data integrity are paramount. Every decision and implementation must prioritize correctness and reliability over convenience or simplicity.
 
-I will now proceed to share the requirements document. Please confirm your understanding of these instructions before we begin the implementation.
+I will now proceed to share the current codebase and requirements document. Please confirm your understanding of these instructions before we begin the implementation.
